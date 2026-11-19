@@ -17,10 +17,10 @@ set -Eeuo pipefail
 log_level=""
 filter_keyword=""
 logfile_path=""
-declare -i scan_lines=0 # 为0代表查看的是全文，不为0代表倒数几行
-# declare -i follow_mode=0 # 为0代表暂时展示，不是实时查看
-declare -i output_mode=0 # 0代表stdout, 1代表输出文件路径
-output_path="" # output_mode为1时才起作用
+output_path=""
+
+declare -i scan_lines=0
+declare -i follow_mode=0
 
 usage() {
     cat <<'EOF'
@@ -55,89 +55,182 @@ info() {
 }
 
 parse_arguments() {
+    local option
+
     while (($# > 0)); do
-        case "$1" in
+        option=$1
+
+        case "$option" in
             -h|--help)
                 usage
                 exit 0
                 ;;
+
             -l|--level)
                 if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
-                    error "Option $1 requires a log level!"
-                    exit 1
+                    error "Option $1 requires a log level"
+                    return 1
                 fi
 
                 if [[ -n "$log_level" ]]; then
-                    error "Mutiple log_level provided"
-                    exit 1
-                fi
-                log_level=$2
-                shift 2
-                ;;
-            -n|--lines)
-                if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
-                    error "Option $1 requires a lines"
-                    exit 1
+                    error "Log level specified multiple times"
+                    return 1
                 fi
 
-                if ((scan_lines != 0)); then
-                    error "Multiple scan_lines provided"
-                    exit 1
-                fi
-                scan_lines=$2
+                log_level=${2^^}
                 shift 2
                 ;;
+
+            --level=*)
+                if [[ -n "$log_level" ]]; then
+                    error "Log level specified multiple times"
+                    return 1
+                fi
+
+                log_level=${1#*=}
+                log_level=${log_level^^}
+
+                if [[ -z "$log_level" ]]; then
+                    error "Option --level requires a log level"
+                    return 1
+                fi
+
+                shift
+                ;;
+
             -k|--keyword)
                 if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
                     error "Option $1 requires a keyword"
-                    exit 1
+                    return 1
                 fi
 
                 if [[ -n "$filter_keyword" ]]; then
-                    error "Mutiple filter_keyword provided"
-                    exit 1
+                    error "Keyword specified multiple times"
+                    return 1
                 fi
+
                 filter_keyword=$2
                 shift 2
                 ;;
-            -o|--output) 
+
+            --keyword=*)
+                if [[ -n "$filter_keyword" ]]; then
+                    error "Keyword specified multiple times"
+                    return 1
+                fi
+
+                filter_keyword=${1#*=}
+
+                if [[ -z "$filter_keyword" ]]; then
+                    error "Option --keyword requires a keyword"
+                    return 1
+                fi
+
+                shift
+                ;;
+
+            -n|--lines)
                 if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
-                    error "Option $1 requires you to provide output_path"
-                    exit 1
+                    error "Option $1 requires a positive integer"
+                    return 1
+                fi
+
+                if ((scan_lines != 0)); then
+                    error "Lines specified multiple times"
+                    return 1
+                fi
+
+                if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    error "Lines must be a positive integer"
+                    return 1
+                fi
+
+                scan_lines=$2
+                shift 2
+                ;;
+
+            --lines=*)
+                if ((scan_lines != 0)); then
+                    error "Lines specified multiple times"
+                    return 1
+                fi
+
+                option=${1#*=}
+
+                if [[ ! "$option" =~ ^[1-9][0-9]*$ ]]; then
+                    error "Lines must be a positive integer"
+                    return 1
+                fi
+
+                scan_lines=$option
+                shift
+                ;;
+
+            -f|--follow)
+                if ((follow_mode)); then
+                    error "Follow mode specified multiple times"
+                    return 1
+                fi
+
+                follow_mode=1
+                shift
+                ;;
+
+            -o|--output)
+                if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
+                    error "Option $1 requires an output path"
+                    return 1
                 fi
 
                 if [[ -n "$output_path" ]]; then
-                    error "Mutiple output_path provided"
-                    exit 1
+                    error "Output path specified multiple times"
+                    return 1
                 fi
-                output_mode=1
-                output_path=$(realpath "$2")
+
+                output_path=$2
                 shift 2
                 ;;
-            # -f|--follow)
-            #     follow_mode=2
-            #     shift
-            #     ;;
+
+            --output=*)
+                if [[ -n "$output_path" ]]; then
+                    error "Output path specified multiple times"
+                    return 1
+                fi
+
+                output_path=${1#*=}
+
+                if [[ -z "$output_path" ]]; then
+                    error "Option --output requires an output path"
+                    return 1
+                fi
+
+                shift
+                ;;
+
             --)
                 shift
-                
+
                 if (($# != 1)) || [[ -n "$logfile_path" ]]; then
-                    error "Exactly one logfile_path is required"
-                    exit 1
+                    error "Exactly one log file is required"
+                    return 1
                 fi
+
                 logfile_path=$1
                 shift
                 ;;
+
             -*)
                 error "Unknown option: $1"
                 usage >&2
-                exit 1
+                return 1
                 ;;
+
             *)
                 if [[ -n "$logfile_path" ]]; then
-                    error "Multiple logfile_path provided"
-                    exit 1
+                    error "Multiple log files provided"
+                    return 1
                 fi
+
                 logfile_path=$1
                 shift
                 ;;
@@ -145,104 +238,259 @@ parse_arguments() {
     done
 
     if [[ -z "$logfile_path" ]]; then
-        error "Logfile path not provided"
+        error "Log file path not provided"
         usage >&2
-        exit 1
+        return 1
     fi
 }
 
-get_log_summary() {
+# validation
+#
+# 校验日志级别
+validate_arguments() {
+    case "$log_level" in
+        ""|DEBUG|INFO|WARN|ERROR)
+            ;;
+        *)
+            error "Invalid log level: $log_level"
+            return 1
+            ;;
+    esac
+}
+
+validate_files() {
+    # output path and input path
+    # input_path 路径必须存在，必须是文件且可读
+    local input_path
+    local output_parent
+
+    if [[ ! -f "$logfile_path" ]]; then
+        error "Log file does not exist or is not a regular file"
+        return 1
+    fi
+
+    if [[ ! -r "$logfile_path" ]]; then
+        error "Log file is not readable"
+        return 1
+    fi
+
+    input_path=$(realpath -e -- "$logfile_path") || {
+        error "Failed to resolve log file path"
+        return 1
+    }
+
+    logfile_path=$input_path
+
+    if [[ -n "$output_path" ]]; then
+        output_parent=$(dirname -- "$output_path")
+
+        # 判断父目录是否存在
+        if [[ ! -d "$output_parent" || ! -w "$output_parent" ]]; then 
+            error "Output directory dose not exist or is not writable"
+            return 1
+        fi
+
+        output_path=$(realpath -m -- "$output_path") || {
+            error "Failed to resolve output path"
+            return 1
+        }
+        
+        # ensure output_path != input_path
+        if [[ "$output_path" == "$logfile_path" ]]; then
+            error "Output file must differ from input log file"
+            return 1
+        fi
+
+        # 如果这个output_path是存在的，那么它必须是regular file且是可写的
+        if [[ -e "$output_path" && ! -f "$output_path" ]]; then
+            error "Output path is not a regular file"
+            return 1
+        fi
+
+        if [[ -e "$output_path" && ! -w "$output_path" ]]; then
+            error "Output file is not writable"
+            return 1
+        fi
+    fi
+}
+
+# output 输出可能是stdout或者一个文件
+init_output() {
+    if [[ -n "$output_path" ]]; then
+        if ! exec 3> "$output_path"; then
+            error "Failed to open output file: $output_path" 
+            return 1
+        fi
+    else
+        exec 3>&1
+    fi
+}
+
+close_output() {
+    exec 3>&-
+}
+
+# 显示模式可能是-f实时读取或者读取一次整个文件
+read_log_source() {
+    if ((scan_lines > 0)); then
+        tail -n "$scan_lines" -- "$logfile_path"
+    else
+        cat -- "$logfile_path"
+    fi
+}
+
+get_line_level() {
+    local line=$1
+
+    read -r _ _ REPLY _ <<< "$line"
+    REPLY=${REPLY^^} # 将获取的level全部大写
+}
+
+# Log Filtering 通过日志等级和keyword过滤
+should_print_line() {
+    local line=$1
+    local line_level
+    local line_lower
+    local keyword_lower
+
+    get_line_level "$line"
+    line_level=$REPLY
+
+    # Filter by log level
+    if [[ -n "$log_level" && "$line_level" != "$log_level" ]]; then
+        return 1
+    fi
+
+    # Filter by keyword 
+    if [[ -n "$filter_keyword" ]]; then
+        line_lower=${line,,}
+        keyword_lower=${filter_keyword,,}
+
+        if [[ "$line_lower" != *"$keyword_lower"* ]]; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+filter_stream() {
+    local line
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if should_print_line "$line"; then
+            printf '%s\n' "$line" >&3
+        fi
+    done
+}
+
+filter_process() {
+    read_log_source | filter_stream
+}
+
+# Log Summary Mode
+summarize_stream() {
+    local line
+    local line_level
+
     local -i line_count=0
     local -i debug_count=0
     local -i info_count=0
     local -i warn_count=0
     local -i error_count=0
+    local -i unknown_count=0
 
-    local -a src_cmd=(cat "$logfile_path")
-    ((scan_lines != 0)) && src_cmd=(tail -n "$scan_lines" "$logfile_path")
-
-    # 打开 fd3: output_mode为1时指向输出文件, 否则指向终端
-    if ((output_mode == 1)); then
-        exec 3> "$output_path"
-    else
-        exec 3>&1
-    fi
-
-    # 只读取一遍文本内容 且为流式读取
-    while read -r line; do
-        # 剔除空行
-        if [[ -z "$line" ]]; then
-            continue
-        fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
 
         ((++line_count))
-        # -q 静默模式
-        if grep -qi "debug" <<< "$line"; then
-            ((debug_count+=1))
-        elif grep -qi "info" <<< "$line"; then
-            ((info_count+=1))
-        elif grep -qi "warn" <<< "$line"; then
-            ((warn_count+=1))
-        else
-            ((error_count+=1))
-        fi
-    done< <("${src_cmd[@]}")
 
-    # 写入控制台 or 文件路径
-    cat<<EOF >&3
+        get_line_level "$line"
+        line_level=$REPLY
+
+        case "$line_level" in
+            DEBUG)
+                ((++debug_count))
+                ;;
+            INFO)
+                ((++info_count))
+                ;;
+            WARN)
+                ((++warn_count))
+                ;;
+            ERROR)
+                ((++error_count))
+                ;;
+            *)
+                ((++unknown_count))
+                ;;
+        esac
+    done
+
+    cat <<EOF >&3
 ========== Log Summary ==========
 Log file: $logfile_path
 Total lines: $line_count
 
-DEBUG: $debug_count
-INFO:  $info_count
-WARN:  $warn_count
-ERROR: $error_count
+DEBUG:   $debug_count
+INFO:    $info_count
+WARN:    $warn_count
+ERROR:   $error_count
+UNKNOWN: $unknown_count
 
 =================================
 EOF
-    exec 3>&-
 }
 
-filter_process() {
-    local -a src_cmd=(cat "$logfile_path")
-    ((scan_lines != 0)) && src_cmd=(tail -n "$scan_lines" "$logfile_path")
+get_log_summary() {
+    read_log_source | summarize_stream
+}
 
-    # 打开 fd3: output_mode为1时指向输出文件, 否则指向stdout
-    if ((output_mode == 1)); then
-        exec 3> "$output_path"
+# Real-time Monitoring
+follow_logs() {
+    local -i initial_lines=0
+
+    initial_lines=$scan_lines
+
+    info "Following log file: $logfile_path"
+    info "Press Ctrl+C to stop monitoring"
+
+    if ((initial_lines > 0)); then
+        tail -n "$initial_lines" -F -- "$logfile_path" | filter_stream
     else
-        # 打开文件时清空一次，后续printf是接连写入
-        exec 3>&1
+        tail -n 0 -F -- "$logfile_path" | filter_stream
     fi
+}
 
-    # 级别和关键字是"与"的关系，用连续的 grep 管道过滤
-    while read -r line; do
-        printf '%s\n' "$line" >&3
-    done< <(
-        if [[ -n "$log_level" && -n "$filter_keyword" ]]; then
-            "${src_cmd[@]}" | grep -i -e "$log_level" | grep -i -e "$filter_keyword"
-        elif [[ -n "$log_level" ]]; then
-            "${src_cmd[@]}" | grep -i -e "$log_level"
-        elif [[ -n "$filter_keyword" ]]; then
-            "${src_cmd[@]}" | grep -i -e "$filter_keyword"
-        else
-            "${src_cmd[@]}"
-        fi
-    )
-    exec 3>&-
+handle_sigint() {
+    printf '\n' >&2
+    info "Monitoring stopped by user"
+    exit 130
+}
+
+handle_sigterm() {
+    printf '\n' >&2
+    info "Monitoring terminated"
+    exit 143
 }
 
 main() {
-    # Step 1: Parse arguments
     parse_arguments "$@"
+    validate_arguments
+    validate_files
+    init_output
 
-    # Step 2: 判断模式, 一种是需要过滤的，一种是没有过滤的基于全部
-    if [[ -n "$log_level" || -n "$filter_keyword" ]]; then # 需要过滤
+    if ((follow_mode)); then
+        trap handle_sigint INT
+        trap handle_sigterm TERM
+        follow_logs
+    elif [[ -n "$log_level" || -n "$filter_keyword" ]]; then
         filter_process
     else
-        get_log_summary # scan_lines and output_mode影响
+        get_log_summary
     fi
+
+    close_output
 }
 
 main "$@"
