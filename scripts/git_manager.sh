@@ -41,9 +41,11 @@ declare -i fetch_mode=0
 declare -i dry_mode=0
 # verbose mode
 declare -i verbose_mode=0
+# number of repositories whose operation failed
+declare -i failure_count=0
 
 # exclude dir
-declare -a exclude_dirs
+declare -a exclude_dirs=()
 # branch name
 branch_name=""
 # workspace dir
@@ -174,7 +176,7 @@ parse_arguments() {
                 fi
                 
                 if [[ -n "$workspace_dir" ]]; then
-                    error "$option can't be specified multiple times!"
+                    error "workspace can't be specified multiple times!"
                     return 1
                 fi
 
@@ -249,22 +251,6 @@ Notes:
     5. --exclude accepts a directory path and can be specified multiple times.
        Paths are resolved to absolute paths.
 EOF
-}
-
-find_all_repositories() {
-    local rootDir="$1"  # 当前起始的遍历dir
-    for f in "$rootDir"/*; do
-        if [[ ! -d "$f" || -L "$f" ]]; then
-            continue
-        fi
-
-        # check whether the current directory is a Git repository
-        if [[ -e "$f/.git" ]]; then
-            printf '%s\n' "$f"
-            continue
-        fi
-        find_all_repositories "$f"
-    done
 }
 
 validate_workspace() {
@@ -361,6 +347,143 @@ validate_and_getOps() {
     return 0
 }
 
+# 判断路径是否命中 --exclude（命中目录本身或它的整棵子树）
+is_excluded() {
+    local path="$1"
+    local excluded
+
+    if ((${#exclude_dirs[@]} == 0)); then
+        return 1
+    fi
+
+    for excluded in "${exclude_dirs[@]}"; do
+        # validate 阶段已 realpath，尾部不会带 /，直接前缀匹配即可
+        if [[ "$path" == "$excluded" || "$path" == "$excluded"/* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# 取仓库当前分支名，detached HEAD 时返回非 0
+get_current_branch() {
+    local repo="$1"
+    git -C "$repo" symbolic-ref --short -q HEAD
+}
+
+record_failure() {
+    error "$1"
+    failure_count+=1
+}
+
+# 统一执行会修改仓库的 git 命令：
+# dry-run 只打印计划，verbose 额外打印实际命令
+run_git() {
+    local repo="$1"
+    shift
+
+    if ((dry_mode)); then
+        info "[DRY-RUN] $repo: git $*"
+        return 0
+    fi
+
+    if ((verbose_mode)); then
+        info "$repo: git $*"
+    fi
+
+    git -C "$repo" "$@"
+}
+
+# 对单个已发现的仓库做过滤，然后执行操作
+process_repository() {
+    local repo="$1"
+    local branch
+
+    # 过滤条件一：--branch 只保留当前分支匹配的仓库（不会切换分支）
+    if [[ -n "$branch_name" ]]; then
+        if ! branch=$(get_current_branch "$repo"); then
+            if ((verbose_mode)); then
+                info "skip $repo: detached HEAD"
+            fi
+            return 0
+        fi
+
+        if [[ "$branch" != "$branch_name" ]]; then
+            if ((verbose_mode)); then
+                info "skip $repo: current branch '$branch' != '$branch_name'"
+            fi
+            return 0
+        fi
+    fi
+
+    # 过滤条件二：--exclude 已在上层 dfs 剪枝，这里无需重复判断
+
+    info "==> $repo"
+
+    case "$git_operation" in
+        status)
+            # status 只读，dry-run 下照常执行
+            if ((verbose_mode)); then
+                info "$repo: git status"
+                git -C "$repo" status || record_failure "git status failed: $repo"
+            else
+                git -C "$repo" status --short --branch || record_failure "git status failed: $repo"
+            fi
+            ;;
+        fetch)
+            run_git "$repo" fetch --all || record_failure "git fetch failed: $repo"
+            ;;
+        pull)
+            run_git "$repo" pull --ff-only || record_failure "git pull failed: $repo"
+            ;;
+        push)
+            run_git "$repo" push || record_failure "git push failed: $repo"
+            ;;
+        *)
+            error "unknown operation: $git_operation"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+dfs_operation() {
+    local root_dir="$1"
+    local f
+
+    for f in "$root_dir"/*; do
+        # 只处理真实目录：普通文件跳过，符号链接跳过（防循环/越界）
+        if [[ ! -d "$f" || -L "$f" ]]; then
+            continue
+        fi
+
+        # 已经是git仓库，不用继续向下探测
+        if [[ "${f##*/}" == ".git" ]]; then
+            continue
+        fi
+
+        # 命中 --exclude 的目录连同整棵子树一起剪掉
+        if is_excluded "$f"; then
+            if ((verbose_mode)); then
+                info "skip excluded: $f"
+            fi
+            continue
+        fi
+
+        if [[ -e "$f/.git" ]]; then
+            # check filter condition (branch and exclude_dir)
+            # process operation (dry-run ? or truely process)
+            process_repository "$f"
+        fi
+
+        if ((recursive_mode)); then
+            dfs_operation "$f"
+        fi
+    done
+}
+
 main() {
     # 1. parse_arguments
     parse_arguments "$@"
@@ -376,6 +499,17 @@ main() {
     # 2.3 validate for operations only one
     validate_and_getOps
     git_operation="$REPLY"
+
+    # 3. process operation
+    dfs_operation "$workspace_dir"
+
+    # 单个仓库失败不中断整体遍历，但最终要返回非 0
+    if ((failure_count > 0)); then
+        error "$failure_count operation(s) failed!"
+        return 1
+    fi
+
+    return 0
 }
 
 main "$@"
